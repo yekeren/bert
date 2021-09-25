@@ -133,8 +133,12 @@ class BertModel(object):
                is_training,
                input_ids,
                input_mask=None,
+               input_tag_mask=None,
+               input_tag_feature=None,
+               input_adv_masks=None,
                token_type_ids=None,
                use_one_hot_embeddings=False,
+               attention_entropy_regularizer=0.0,
                scope=None):
     """Constructor for BertModel.
 
@@ -169,6 +173,7 @@ class BertModel(object):
       token_type_ids = tf.zeros(shape=[batch_size, seq_length], dtype=tf.int32)
 
     with tf.variable_scope(scope, default_name="bert"):
+
       with tf.variable_scope("embeddings"):
         # Perform embedding lookup on the word ids.
         (self.embedding_output, self.embedding_table) = embedding_lookup(
@@ -178,6 +183,17 @@ class BertModel(object):
             initializer_range=config.initializer_range,
             word_embedding_name="word_embeddings",
             use_one_hot_embeddings=use_one_hot_embeddings)
+
+        if input_adv_masks is not None:
+          MASK_ID = 103
+          mask_embeddings = self.embedding_table[103]
+          mask_embeddings = tf.expand_dims(tf.expand_dims(mask_embeddings, 0),
+                                           0)
+          input_adv_masks = tf.expand_dims(input_adv_masks, -1)
+
+          self.embedding_output = tf.add(
+              self.embedding_output * (1 - input_adv_masks),
+              mask_embeddings * input_adv_masks)
 
         # Add positional embeddings and token type embeddings, then layer
         # normalize and perform dropout.
@@ -189,6 +205,8 @@ class BertModel(object):
             token_type_embedding_name="token_type_embeddings",
             use_position_embeddings=True,
             position_embedding_name="position_embeddings",
+            input_tag_mask=input_tag_mask,
+            input_tag_feature=input_tag_feature,
             initializer_range=config.initializer_range,
             max_position_embeddings=config.max_position_embeddings,
             dropout_prob=config.hidden_dropout_prob)
@@ -213,6 +231,7 @@ class BertModel(object):
             hidden_dropout_prob=config.hidden_dropout_prob,
             attention_probs_dropout_prob=config.attention_probs_dropout_prob,
             initializer_range=config.initializer_range,
+            attention_entropy_regularizer=attention_entropy_regularizer,
             do_return_all_layers=True)
 
       self.sequence_output = self.all_encoder_layers[-1]
@@ -224,7 +243,8 @@ class BertModel(object):
       with tf.variable_scope("pooler"):
         # We "pool" the model by simply taking the hidden state corresponding
         # to the first token. We assume that this has been pre-trained
-        first_token_tensor = tf.squeeze(self.sequence_output[:, 0:1, :], axis=1)
+        first_token_tensor = tf.squeeze(
+            self.sequence_output[:, 0:1, :], axis=1)
         self.pooled_output = tf.layers.dense(
             first_token_tensor,
             config.hidden_size,
@@ -361,8 +381,10 @@ def dropout(input_tensor, dropout_prob):
 
 def layer_norm(input_tensor, name=None):
   """Run layer normalization on the last dimension of the tensor."""
-  return tf.contrib.layers.layer_norm(
-      inputs=input_tensor, begin_norm_axis=-1, begin_params_axis=-1, scope=name)
+  return tf.contrib.layers.layer_norm(inputs=input_tensor,
+                                      begin_norm_axis=-1,
+                                      begin_params_axis=-1,
+                                      scope=name)
 
 
 def layer_norm_and_dropout(input_tensor, dropout_prob, name=None):
@@ -382,7 +404,8 @@ def embedding_lookup(input_ids,
                      embedding_size=128,
                      initializer_range=0.02,
                      word_embedding_name="word_embeddings",
-                     use_one_hot_embeddings=False):
+                     use_one_hot_embeddings=False,
+                     word_embedding_trainable=True):
   """Looks up words embeddings for id tensor.
 
   Args:
@@ -409,7 +432,8 @@ def embedding_lookup(input_ids,
   embedding_table = tf.get_variable(
       name=word_embedding_name,
       shape=[vocab_size, embedding_size],
-      initializer=create_initializer(initializer_range))
+      initializer=create_initializer(initializer_range),
+      trainable=word_embedding_trainable)
 
   flat_input_ids = tf.reshape(input_ids, [-1])
   if use_one_hot_embeddings:
@@ -432,6 +456,8 @@ def embedding_postprocessor(input_tensor,
                             token_type_embedding_name="token_type_embeddings",
                             use_position_embeddings=True,
                             position_embedding_name="position_embeddings",
+                            input_tag_mask=None,
+                            input_tag_feature=None,
                             initializer_range=0.02,
                             max_position_embeddings=512,
                             dropout_prob=0.1):
@@ -517,6 +543,9 @@ def embedding_postprocessor(input_tensor,
                                        position_broadcast_shape)
       output += position_embeddings
 
+  if input_tag_feature is not None:
+    output += input_tag_feature
+
   output = layer_norm_and_dropout(output, dropout_prob)
   return output
 
@@ -538,16 +567,16 @@ def create_attention_mask_from_input_mask(from_tensor, to_mask):
   to_shape = get_shape_list(to_mask, expected_rank=2)
   to_seq_length = to_shape[1]
 
-  to_mask = tf.cast(
-      tf.reshape(to_mask, [batch_size, 1, to_seq_length]), tf.float32)
+  to_mask = tf.cast(tf.reshape(to_mask, [batch_size, 1, to_seq_length]),
+                    tf.float32)
 
   # We don't assume that `from_tensor` is a mask (although it could be). We
   # don't actually care if we attend *from* padding tokens (only *to* padding)
   # tokens so we create a tensor of all ones.
   #
   # `broadcast_ones` = [batch_size, from_seq_length, 1]
-  broadcast_ones = tf.ones(
-      shape=[batch_size, from_seq_length, 1], dtype=tf.float32)
+  broadcast_ones = tf.ones(shape=[batch_size, from_seq_length, 1],
+                           dtype=tf.float32)
 
   # Here we broadcast along two dimensions to create the mask.
   mask = broadcast_ones * to_mask
@@ -568,7 +597,8 @@ def attention_layer(from_tensor,
                     do_return_2d_tensor=False,
                     batch_size=None,
                     from_seq_length=None,
-                    to_seq_length=None):
+                    to_seq_length=None,
+                    attention_entropy_regularizer=0.0):
   """Performs multi-headed attention from `from_tensor` to `to_tensor`.
 
   This is an implementation of multi-headed attention based on "Attention
@@ -719,6 +749,19 @@ def attention_layer(from_tensor,
   # `attention_probs` = [B, N, F, T]
   attention_probs = tf.nn.softmax(attention_scores)
 
+  tf.summary.histogram('bert_attn/scores', attention_scores)
+  tf.summary.histogram('bert_attn/probs', attention_probs)
+
+  if attention_entropy_regularizer > 0.0:
+    attention_log_probs = tf.nn.log_softmax(attention_scores)
+    per_attention_entropy_losses = - \
+        tf.reduce_sum(attention_probs * attention_log_probs, axis=-1)
+    per_attention_entropy_loss = tf.reduce_mean(per_attention_entropy_losses)
+
+    loss = attention_entropy_regularizer * per_attention_entropy_loss
+    tf.compat.v1.summary.scalar('metrics/attention_regularization_loss', loss)
+    tf.losses.add_loss(-loss)  # Maximize the entropy.
+
   # This is actually dropping out entire tokens to attend to, which might
   # seem a bit unusual, but is taken from the original Transformer paper.
   attention_probs = dropout(attention_probs, attention_probs_dropout_prob)
@@ -761,6 +804,7 @@ def transformer_model(input_tensor,
                       hidden_dropout_prob=0.1,
                       attention_probs_dropout_prob=0.1,
                       initializer_range=0.02,
+                      attention_entropy_regularizer=0.0,
                       do_return_all_layers=False):
   """Multi-headed, multi-layer Transformer from "Attention is All You Need".
 
@@ -841,7 +885,8 @@ def transformer_model(input_tensor,
               do_return_2d_tensor=True,
               batch_size=batch_size,
               from_seq_length=seq_length,
-              to_seq_length=seq_length)
+              to_seq_length=seq_length,
+              attention_entropy_regularizer=attention_entropy_regularizer)
           attention_heads.append(attention_head)
 
         attention_output = None
